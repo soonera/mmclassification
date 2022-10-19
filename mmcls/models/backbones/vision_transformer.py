@@ -144,7 +144,7 @@ class BEiTTransformerEncoderLayer(TransformerEncoderLayer):
                  num_heads: int,
                  feedforward_channels: int,
                  layer_scale_init_value: float,
-                 window_size: Tuple[int, int],
+                 window_size: Optional[Tuple[int, int]] = None,
                  drop_rate: float = 0.,
                  attn_drop_rate: float = 0.,
                  drop_path_rate: float = 0.,
@@ -197,16 +197,23 @@ class BEiTTransformerEncoderLayer(TransformerEncoderLayer):
         dropout_layer = dict(type='DropPath', drop_prob=drop_path_rate)
         self.drop_path = build_dropout(
             dropout_layer) if dropout_layer else nn.Identity()
-        self.gamma_1 = nn.Parameter(
-            layer_scale_init_value * torch.ones((embed_dims)),
-            requires_grad=True)
-        self.gamma_2 = nn.Parameter(
-            layer_scale_init_value * torch.ones((embed_dims)),
-            requires_grad=True)
+        if layer_scale_init_value > 0:
+            self.gamma_1 = nn.Parameter(
+                layer_scale_init_value * torch.ones((embed_dims)),
+                requires_grad=True)
+            self.gamma_2 = nn.Parameter(
+                layer_scale_init_value * torch.ones((embed_dims)),
+                requires_grad=True)
+        else:
+            self.gamma_1, self.gamma_2 = None, None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.gamma_2 * self.ffn(self.norm2(x)))
+    def forward(self, x: torch.Tensor, rel_pos_bias: torch.Tensor=None) -> torch.Tensor:
+        if self.gamma_1 is None:
+            x = x + self.drop_path(self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias))
+            x = x + self.drop_path(self.ffn(self.norm2(x)))
+        else:
+            x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias))
+            x = x + self.drop_path(self.gamma_2 * self.ffn(self.norm2(x)))
         return x
 
 
@@ -256,6 +263,12 @@ class VisionTransformer(BaseBackbone):
         output_cls_token (bool): Whether output the cls_token. If set True,
             ``with_cls_token`` must be True. Defaults to True.
         beit_style (bool): Whether or not use BEiT-style. Defaults to False.
+        use_abs_pos_emb (bool): Whether or not use absolute position embedding.
+            Defaults to True.
+        use_rel_pos_bias (bool): Whether or not use relative position bias.
+            Defaults to False.
+        use_shared_rel_pos_bias (bool): Whether or not use shared relative
+            position bias. Defaults to False.
         layer_scale_init_value (float): The initialization value for
             the learnable scaling of attention and FFN. Defaults to 0.1.
         interpolate_mode (str): Select the interpolate mode for position
@@ -339,6 +352,9 @@ class VisionTransformer(BaseBackbone):
                  frozen_stages=-1,
                  output_cls_token=True,
                  beit_style=False,
+                 use_abs_pos_emb=True,
+                 use_rel_pos_bias=False,
+                 use_shared_rel_pos_bias=False,
                  layer_scale_init_value=0.1,
                  interpolate_mode='bicubic',
                  patch_cfg=dict(),
@@ -386,11 +402,14 @@ class VisionTransformer(BaseBackbone):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dims))
 
         # Set position embedding
-        self.interpolate_mode = interpolate_mode
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches + self.num_extra_tokens,
-                        self.embed_dims))
-        self._register_load_state_dict_pre_hook(self._prepare_pos_embed)
+        if use_abs_pos_emb:
+            self.interpolate_mode = interpolate_mode
+            self.pos_embed = nn.Parameter(
+                torch.zeros(1, num_patches + self.num_extra_tokens,
+                            self.embed_dims))
+            self._register_load_state_dict_pre_hook(self._prepare_pos_embed)
+        else:
+            self.pos_embed = None
 
         self.drop_after_pos = nn.Dropout(p=drop_rate)
 
@@ -427,7 +446,7 @@ class VisionTransformer(BaseBackbone):
                 _layer_cfg.update(
                     dict(
                         layer_scale_init_value=layer_scale_init_value,
-                        window_size=self.patch_resolution))
+                        window_size=self.patch_resolution if use_rel_pos_bias else None))
                 _layer_cfg.pop('qkv_bias')
                 self.layers.append(BEiTTransformerEncoderLayer(**_layer_cfg))
             else:
@@ -462,7 +481,8 @@ class VisionTransformer(BaseBackbone):
 
         if not (isinstance(self.init_cfg, dict)
                 and self.init_cfg['type'] == 'Pretrained'):
-            trunc_normal_(self.pos_embed, std=0.02)
+            if self.pos_embed:
+                trunc_normal_(self.pos_embed, std=0.02)
 
     def _prepare_pos_embed(self, state_dict, prefix, *args, **kwargs):
         name = prefix + 'pos_embed'
@@ -522,12 +542,13 @@ class VisionTransformer(BaseBackbone):
         # stole cls_tokens impl from Phil Wang, thanks
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
-        x = x + resize_pos_embed(
-            self.pos_embed,
-            self.patch_resolution,
-            patch_resolution,
-            mode=self.interpolate_mode,
-            num_extra_tokens=self.num_extra_tokens)
+        if self.pos_embed is not None:
+            x = x + resize_pos_embed(
+                self.pos_embed,
+                self.patch_resolution,
+                patch_resolution,
+                mode=self.interpolate_mode,
+                num_extra_tokens=self.num_extra_tokens)
         x = self.drop_after_pos(x)
 
         if not self.with_cls_token:
